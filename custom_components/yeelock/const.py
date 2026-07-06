@@ -31,6 +31,12 @@ LOCKER_KIND = {
 ADVERTISEMENT_WAIT_TIMEOUT = 30
 # User lock/unlock actions wait longer because Yeelocks advertise infrequently.
 LOCK_ADVERTISEMENT_WAIT_TIMEOUT = 60
+# HA connectable history needs a recent advertisement (seconds).
+CONNECTABLE_ADVERTISEMENT_MAX_AGE = 30
+# Pause after stopping active scans before opening a connection.
+PRE_CONNECT_DELAY_SECONDS = 0.5
+# Active scan burst to wake sleeping locks (seconds).
+ACTIVE_SCAN_BURST_SECONDS = 10
 # Retry BLE connections after an advertisement is observed.
 CONNECTION_MAX_ATTEMPTS = 6
 # Keep the connection open briefly to receive lock state notifications.
