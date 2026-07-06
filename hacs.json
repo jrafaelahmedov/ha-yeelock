@@ -1,7 +1,4 @@
 {
 	"name": "Yeelock BLE",
-	"filename": "yeelock.zip",
-	"hide_default_branch": true,
-	"render_readme": true,
-	"zip_release": true
+	"render_readme": true
 }
