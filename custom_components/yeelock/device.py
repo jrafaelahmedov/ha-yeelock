@@ -25,8 +25,6 @@ from homeassistant.helpers import device_registry as dr
 
 from .const import (
     ACTIVE_SCAN_BURST_SECONDS,
-    ACTIVE_SCAN_SCHEDULE_DURATION,
-    ACTIVE_SCAN_SCHEDULE_INTERVAL,
     ADVERTISEMENT_WAIT_TIMEOUT,
     BLE_SEMAPHORE_KEY,
     COMMAND_FINAL_STATE,
@@ -222,8 +220,6 @@ class Yeelock:
     async def _wait_for_connectable_advertisement(
         self,
         timeout: int | None = None,
-        *,
-        aggressive_scan: bool = False,
     ) -> bluetooth.BluetoothServiceInfoBleak:
         """Wait until the lock sends a fresh connectable advertisement."""
         normalized_mac = self.mac.upper()
@@ -273,24 +269,11 @@ class Yeelock:
             )
             done.set_result(service_info)
 
-        scan_mode = (
-            bluetooth.BluetoothScanningMode.ACTIVE
-            if aggressive_scan
-            else bluetooth.BluetoothScanningMode.PASSIVE
-        )
-        callback_kwargs: dict[str, float] = {}
-        if aggressive_scan:
-            callback_kwargs = {
-                "scan_interval": ACTIVE_SCAN_SCHEDULE_INTERVAL,
-                "scan_duration": ACTIVE_SCAN_SCHEDULE_DURATION,
-            }
-
         remove_callback = bluetooth.async_register_callback(
             self._hass,
             _async_bluetooth_callback,
             {ADDRESS: self.mac},
-            scan_mode,
-            **callback_kwargs,
+            bluetooth.BluetoothScanningMode.PASSIVE,
         )
         deadline = loop.time() + wait_timeout
         try:
@@ -402,7 +385,6 @@ class Yeelock:
             await self._trigger_active_scan_burst()
             service_info = await self._wait_for_connectable_advertisement(
                 timeout=SERVICE_DISCOVERY_RETRY_AD_TIMEOUT,
-                aggressive_scan=True,
             )
             await asyncio.sleep(PRE_CONNECT_DELAY_SECONDS)
             ble_device = self._prepare_ble_device_for_connect(service_info)
@@ -424,7 +406,6 @@ class Yeelock:
         *,
         wait_for_advertisement: bool = True,
         advertisement_timeout: int | None = None,
-        aggressive_scan: bool = False,
     ):
         """Connect to the device.
 
@@ -442,7 +423,6 @@ class Yeelock:
                 if wait_for_advertisement:
                     service_info = await self._wait_for_connectable_advertisement(
                         timeout=advertisement_timeout,
-                        aggressive_scan=aggressive_scan,
                     )
                     await asyncio.sleep(PRE_CONNECT_DELAY_SECONDS)
                     ble_device = self._prepare_ble_device_for_connect(service_info)
@@ -612,7 +592,6 @@ class Yeelock:
             try:
                 await self._connect(
                     advertisement_timeout=LOCK_ADVERTISEMENT_WAIT_TIMEOUT,
-                    aggressive_scan=True,
                 )
                 loop = asyncio.get_running_loop()
                 self._command_state_waiter = loop.create_future()
@@ -625,7 +604,7 @@ class Yeelock:
                 _LOGGER.error("BleakError for %s (%s): %s", self.name, self.mac, error)
                 if any(
                     marker in str(error).lower()
-                    for marker in ("connection slot", "discover services")
+                    for marker in ("connection slot", "discover services", "timeout")
                 ):
                     self._locker_cooldown_until = (
                         monotonic_time_coarse() + LOCKER_FAILURE_COOLDOWN_SECONDS
