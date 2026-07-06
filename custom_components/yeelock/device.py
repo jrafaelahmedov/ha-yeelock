@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import hmac
 import logging
-import time as time_module
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -27,7 +26,6 @@ from .const import (
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY,
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
     DOMAIN,
-    FRESH_ADVERTISEMENT_MAX_AGE,
     LOCKER_KIND,
     LOCK_ADVERTISEMENT_WAIT_TIMEOUT,
     NOTIFICATION_WAIT_SECONDS,
@@ -151,18 +149,9 @@ class Yeelock:
                 return
             if service_info.address.upper() != normalized_mac:
                 return
-            age = time_module.monotonic() - service_info.time
-            if age > FRESH_ADVERTISEMENT_MAX_AGE:
-                _LOGGER.debug(
-                    "Ignoring stale advertisement for %s (age=%.1fs)",
-                    self.mac,
-                    age,
-                )
-                return
             _LOGGER.debug(
-                "Fresh advertisement for %s (age=%.1fs, rssi=%s, source=%s)",
+                "Advertisement for %s (rssi=%s, source=%s)",
                 self.mac,
-                age,
                 service_info.rssi,
                 service_info.source,
             )
@@ -177,6 +166,19 @@ class Yeelock:
         try:
             return await asyncio.wait_for(done, timeout=wait_timeout)
         except TimeoutError as error:
+            last = bluetooth.async_last_service_info(
+                self._hass, self.mac, connectable=True
+            )
+            if last and bluetooth.async_ble_device_from_address(
+                self._hass, self.mac, connectable=True
+            ):
+                _LOGGER.info(
+                    "Using last connectable advertisement for %s (%s)",
+                    self.name or self.mac,
+                    self.mac,
+                )
+                return last
+
             diagnostics = "unavailable"
             try:
                 diagnostics = bluetooth.async_address_reachability_diagnostics(
