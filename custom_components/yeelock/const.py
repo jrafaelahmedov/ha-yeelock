@@ -28,12 +28,12 @@ LOCKER_KIND = {
 }
 
 # Wait for a live BLE advertisement before connecting (seconds).
-ADVERTISEMENT_WAIT_TIMEOUT = 20
-# Only connect after an advertisement at most this many seconds old.
-FRESH_ADVERTISEMENT_MAX_AGE = 10
+ADVERTISEMENT_WAIT_TIMEOUT = 30
+# User lock/unlock actions wait longer because Yeelocks advertise infrequently.
+LOCK_ADVERTISEMENT_WAIT_TIMEOUT = 90
+# Only accept advertisements at most this many seconds old.
+FRESH_ADVERTISEMENT_MAX_AGE = 15
 # Retry BLE connections after a fresh advertisement is observed.
 CONNECTION_MAX_ATTEMPTS = 6
 # Keep the connection open briefly to receive lock state notifications.
 NOTIFICATION_WAIT_SECONDS = 1.0
-# Defer startup battery reads so multiple locks do not fight at boot.
-STARTUP_BATTERY_DELAY = 90

@@ -29,6 +29,7 @@ from .const import (
     DOMAIN,
     FRESH_ADVERTISEMENT_MAX_AGE,
     LOCKER_KIND,
+    LOCK_ADVERTISEMENT_WAIT_TIMEOUT,
     NOTIFICATION_WAIT_SECONDS,
     UUID_COMMAND,
     UUID_NOTIFY,
@@ -126,15 +127,17 @@ class Yeelock:
 
     async def _wait_for_connectable_advertisement(
         self,
+        timeout: int | None = None,
     ) -> bluetooth.BluetoothServiceInfoBleak:
         """Wait until the lock sends a fresh connectable advertisement."""
         normalized_mac = self.mac.upper()
+        wait_timeout = timeout or ADVERTISEMENT_WAIT_TIMEOUT
         loop = asyncio.get_running_loop()
         done: asyncio.Future[bluetooth.BluetoothServiceInfoBleak] = loop.create_future()
 
         _LOGGER.info(
             "Waiting up to %ss for %s (%s) to advertise",
-            ADVERTISEMENT_WAIT_TIMEOUT,
+            wait_timeout,
             self.name or self.mac,
             self.mac,
         )
@@ -172,7 +175,7 @@ class Yeelock:
             bluetooth.BluetoothScanningMode.ACTIVE,
         )
         try:
-            return await asyncio.wait_for(done, timeout=ADVERTISEMENT_WAIT_TIMEOUT)
+            return await asyncio.wait_for(done, timeout=wait_timeout)
         except TimeoutError as error:
             diagnostics = "unavailable"
             try:
@@ -190,13 +193,12 @@ class Yeelock:
                 "Diagnostics: %s",
                 self.name or self.mac,
                 self.mac,
-                ADVERTISEMENT_WAIT_TIMEOUT,
+                wait_timeout,
                 diagnostics,
             )
             raise BleakError(
                 f"Lock {self.mac} did not advertise within "
-                f"{ADVERTISEMENT_WAIT_TIMEOUT}s. Wake the lock in the "
-                "Yeelock app and try again."
+                f"{wait_timeout}s. Wake the lock in the Yeelock app and try again."
             ) from error
         finally:
             remove_callback()
@@ -215,7 +217,12 @@ class Yeelock:
 
         return None
 
-    async def _connect(self, *, wait_for_advertisement: bool = True):
+    async def _connect(
+        self,
+        *,
+        wait_for_advertisement: bool = True,
+        advertisement_timeout: int | None = None,
+    ):
         """Connect to the device.
 
         :raises BleakError: if the device is not found
@@ -230,7 +237,9 @@ class Yeelock:
             self._connecting = True
             try:
                 if wait_for_advertisement:
-                    service_info = await self._wait_for_connectable_advertisement()
+                    service_info = await self._wait_for_connectable_advertisement(
+                        timeout=advertisement_timeout
+                    )
                     ble_device = service_info.device
                     self._device = ble_device
                 else:
@@ -393,7 +402,9 @@ class Yeelock:
         self._last_action = kind
         async with _adapter_session(self._hass):
             try:
-                await self._connect()
+                await self._connect(
+                    advertisement_timeout=LOCK_ADVERTISEMENT_WAIT_TIMEOUT
+                )
                 _LOGGER.debug("Sending %s command to %s", kind, self.mac)
                 await self._client.write_gatt_char(
                     uuid.UUID(UUID_COMMAND), bytearray(self._encrypt(LOCKER_KIND[kind]))

@@ -1,6 +1,5 @@
 """Yeelock sensors."""
 
-import asyncio
 import logging
 
 from homeassistant.components.sensor import (
@@ -13,7 +12,7 @@ from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, STARTUP_BATTERY_DELAY
+from .const import DOMAIN
 from .device import Yeelock, YeelockDeviceEntity
 
 
@@ -45,19 +44,6 @@ class YeelockBatterySensor(YeelockDeviceEntity, SensorEntity):
         await super().async_added_to_hass()
         if self.device.battery_level is not None:
             self._attr_native_value = self.device.battery_level
-
-        async def _deferred_battery_read() -> None:
-            await asyncio.sleep(STARTUP_BATTERY_DELAY)
-            try:
-                await self.device.update_battery()
-            except Exception as error:  # pragma: no cover - defensive
-                _LOGGER.debug(
-                    "Deferred battery read failed for %s: %s",
-                    self.device.mac,
-                    error,
-                )
-
-        self.hass.async_create_task(_deferred_battery_read())
 
     async def _update_battery_level(self, new_level: int) -> None:
         """Handle push updates from BLE notifications."""
