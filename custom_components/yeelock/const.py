@@ -27,7 +27,9 @@ LOCKER_KIND = {
 }
 
 # Wait for a live BLE advertisement before connecting (seconds).
-ADVERTISEMENT_WAIT_TIMEOUT = 20
+ADVERTISEMENT_WAIT_TIMEOUT = 30
+# Only connect after an advertisement at most this many seconds old.
+FRESH_ADVERTISEMENT_MAX_AGE = 5
 # Retry BLE connections; newer HA Bluetooth stacks need more attempts.
 CONNECTION_MAX_ATTEMPTS = 10
 # Keep the connection open briefly to receive lock state notifications.

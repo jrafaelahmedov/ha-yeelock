@@ -12,8 +12,9 @@ from bleak_retry_connector import BleakClientWithServiceCache, establish_connect
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS
 from homeassistant.const import CONF_API_KEY, CONF_MAC, CONF_MODEL, CONF_NAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
+from homeassistant.util.timeout import monotonic_time_coarse
 
 from .const import (
     ADVERTISEMENT_WAIT_TIMEOUT,
@@ -23,6 +24,7 @@ from .const import (
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY,
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
     DOMAIN,
+    FRESH_ADVERTISEMENT_MAX_AGE,
     LOCKER_KIND,
     NOTIFICATION_WAIT_SECONDS,
     UUID_COMMAND,
@@ -111,29 +113,55 @@ class Yeelock:
         except BleakError as error:
             _LOGGER.debug("Ignoring disconnect error for %s: %s", self.mac, error)
 
-    async def _wait_for_connectable_advertisement(self) -> None:
-        """Wait until the lock advertises on a connectable scanner."""
+    async def _wait_for_connectable_advertisement(
+        self,
+    ) -> bluetooth.BluetoothServiceInfoBleak:
+        """Wait until the lock sends a fresh connectable advertisement."""
         normalized_mac = self.mac.upper()
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future[bluetooth.BluetoothServiceInfoBleak] = loop.create_future()
 
-        def _process_advertisement(
+        @callback
+        def _async_bluetooth_callback(
             service_info: bluetooth.BluetoothServiceInfoBleak,
-        ) -> bool:
-            return service_info.address.upper() == normalized_mac
-
-        try:
-            service_info = await bluetooth.async_process_advertisements(
-                self._hass,
-                _process_advertisement,
-                {ADDRESS: self.mac},
-                bluetooth.BluetoothScanningMode.ACTIVE,
-                ADVERTISEMENT_WAIT_TIMEOUT,
+            _change: bluetooth.BluetoothChange,
+        ) -> None:
+            if done.done():
+                return
+            if service_info.address.upper() != normalized_mac:
+                return
+            age = monotonic_time_coarse() - service_info.time
+            if age > FRESH_ADVERTISEMENT_MAX_AGE:
+                _LOGGER.debug(
+                    "Ignoring stale advertisement for %s (age=%.1fs)",
+                    self.mac,
+                    age,
+                )
+                return
+            _LOGGER.debug(
+                "Fresh advertisement for %s (age=%.1fs, rssi=%s, source=%s)",
+                self.mac,
+                age,
+                service_info.rssi,
+                service_info.source,
             )
+            done.set_result(service_info)
+
+        remove_callback = bluetooth.async_register_callback(
+            self._hass,
+            _async_bluetooth_callback,
+            {ADDRESS: self.mac},
+            bluetooth.BluetoothScanningMode.ACTIVE,
+        )
+        try:
+            return await asyncio.wait_for(done, timeout=ADVERTISEMENT_WAIT_TIMEOUT)
         except TimeoutError as error:
             diagnostics = bluetooth.async_address_reachability_diagnostics(
                 self._hass, self.mac
             )
             _LOGGER.warning(
-                "Lock %s did not advertise within %ss. Diagnostics: %s",
+                "Lock %s did not send a fresh advertisement within %ss. "
+                "Diagnostics: %s",
                 self.mac,
                 ADVERTISEMENT_WAIT_TIMEOUT,
                 diagnostics,
@@ -143,14 +171,8 @@ class Yeelock:
                 f"{ADVERTISEMENT_WAIT_TIMEOUT}s. Wake the lock in the "
                 "Yeelock app and try again."
             ) from error
-
-        self._device = service_info.device
-        _LOGGER.debug(
-            "Lock %s advertised (rssi=%s, source=%s)",
-            self.mac,
-            service_info.rssi,
-            service_info.source,
-        )
+        finally:
+            remove_callback()
 
     def _resolve_ble_device(self):
         """Return the freshest BLEDevice for this lock."""
@@ -181,9 +203,12 @@ class Yeelock:
             self._connecting = True
             try:
                 if wait_for_advertisement:
-                    await self._wait_for_connectable_advertisement()
+                    service_info = await self._wait_for_connectable_advertisement()
+                    ble_device = service_info.device
+                    self._device = ble_device
+                else:
+                    ble_device = self._resolve_ble_device()
 
-                ble_device = self._resolve_ble_device()
                 if not ble_device:
                     raise BleakError(
                         f"A device with address {self.mac} could not be found."
@@ -326,18 +351,20 @@ class Yeelock:
     async def locker(self, kind) -> None:
         """Lock, unlock and quick unlock the device."""
         self._last_action = kind  # Save action before attempting
+        command_sent = False
         try:
             await self._connect()
             _LOGGER.debug("Sending %s command to %s", kind, self.mac)
             await self._client.write_gatt_char(
                 uuid.UUID(UUID_COMMAND), bytearray(self._encrypt(LOCKER_KIND[kind]))
             )
+            command_sent = True
             await asyncio.sleep(NOTIFICATION_WAIT_SECONDS)
         except BleakError as error:
             _LOGGER.error("BleakError: %s", error)
             raise
         finally:
-            if self._battery_sensor is not None:
+            if command_sent and self._battery_sensor is not None:
                 try:
                     await self.update_battery()
                 except BleakError as error:
