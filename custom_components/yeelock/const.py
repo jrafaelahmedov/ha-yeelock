@@ -27,17 +27,31 @@ LOCKER_KIND = {
     "unlock_quick": "00",
 }
 
+COMMAND_FINAL_STATE = {
+    "lock": "locked",
+    "unlock": "unlocked",
+    "unlock_quick": "unlocked",
+}
+
+COMMAND_TRANSITIONAL_STATE = {
+    "lock": "locking",
+    "unlock": "unlocking",
+    "unlock_quick": "unlocking",
+}
+
 # Wait for a live BLE advertisement before connecting (seconds).
 ADVERTISEMENT_WAIT_TIMEOUT = 30
 # User lock/unlock actions wait longer because Yeelocks advertise infrequently.
-LOCK_ADVERTISEMENT_WAIT_TIMEOUT = 60
+LOCK_ADVERTISEMENT_WAIT_TIMEOUT = 45
 # HA connectable history needs a recent advertisement (seconds).
 CONNECTABLE_ADVERTISEMENT_MAX_AGE = 30
 # Pause after stopping active scans before opening a connection.
 PRE_CONNECT_DELAY_SECONDS = 0.5
 # Active scan burst to wake sleeping locks (seconds).
-ACTIVE_SCAN_BURST_SECONDS = 10
+ACTIVE_SCAN_BURST_SECONDS = 5
 # Retry BLE connections after an advertisement is observed.
-CONNECTION_MAX_ATTEMPTS = 6
+CONNECTION_MAX_ATTEMPTS = 4
+# Wait for the lock to report locked/unlocked after sending a command.
+LOCK_COMMAND_RESULT_TIMEOUT = 8.0
 # Keep the connection open briefly to receive lock state notifications.
 NOTIFICATION_WAIT_SECONDS = 1.0

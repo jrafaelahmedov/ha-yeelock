@@ -23,6 +23,8 @@ from .const import (
     ACTIVE_SCAN_BURST_SECONDS,
     ADVERTISEMENT_WAIT_TIMEOUT,
     BLE_SEMAPHORE_KEY,
+    COMMAND_FINAL_STATE,
+    COMMAND_TRANSITIONAL_STATE,
     CONF_AUTO_UNLOCK_LOW_BATTERY,
     CONF_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
     CONNECTABLE_ADVERTISEMENT_MAX_AGE,
@@ -32,6 +34,7 @@ from .const import (
     DOMAIN,
     LOCKER_KIND,
     LOCK_ADVERTISEMENT_WAIT_TIMEOUT,
+    LOCK_COMMAND_RESULT_TIMEOUT,
     NOTIFICATION_WAIT_SECONDS,
     PRE_CONNECT_DELAY_SECONDS,
     UUID_COMMAND,
@@ -103,6 +106,53 @@ class Yeelock:
             DEFAULT_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
         )
         self._auto_unlock_triggered = False
+        self._command_state_waiter: asyncio.Future[str] | None = None
+
+    def _resolve_command_state_waiter(self, new_state: str) -> None:
+        """Complete a pending lock/unlock wait when a final state arrives."""
+        if self._command_state_waiter is None or self._command_state_waiter.done():
+            return
+        if new_state in ("locked", "unlocked", "jammed"):
+            self._command_state_waiter.set_result(new_state)
+
+    async def _wait_for_command_result(self, kind: str) -> None:
+        """Stay connected until the lock reports a final state."""
+        final_state = COMMAND_FINAL_STATE[kind]
+        transitional_state = COMMAND_TRANSITIONAL_STATE[kind]
+
+        if self._lock is not None and self._lock._attr_state == final_state:
+            return
+
+        if self._command_state_waiter is None:
+            loop = asyncio.get_running_loop()
+            self._command_state_waiter = loop.create_future()
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(self._command_state_waiter),
+                timeout=LOCK_COMMAND_RESULT_TIMEOUT,
+            )
+            if result == "jammed":
+                raise BleakError(f"Lock {self.mac} reported jammed")
+        except TimeoutError:
+            current = self._lock._attr_state if self._lock is not None else None
+            if current == transitional_state and self._lock is not None:
+                _LOGGER.info(
+                    "Lock %s reached %s but did not confirm %s; assuming success",
+                    self.name or self.mac,
+                    transitional_state,
+                    final_state,
+                )
+                await self._lock._update_lock_state(final_state)
+                return
+            if current in (transitional_state, final_state) and self._lock is not None:
+                await self._lock._update_lock_state("unknown")
+            raise BleakError(
+                f"Lock {self.mac} did not confirm {final_state} within "
+                f"{LOCK_COMMAND_RESULT_TIMEOUT:.0f}s"
+            ) from None
+        finally:
+            self._command_state_waiter = None
 
     async def disconnect(self):
         """Disconnect from the device."""
@@ -419,6 +469,7 @@ class Yeelock:
         # Update to the new lock state, if we have one
         if new_state is not None:
             _LOGGER.debug("Notified of %s", new_state)
+            self._resolve_command_state_waiter(new_state)
             if self._lock is not None:
                 await self._lock._update_lock_state(new_state)
 
@@ -475,17 +526,18 @@ class Yeelock:
                 await self._connect(
                     advertisement_timeout=LOCK_ADVERTISEMENT_WAIT_TIMEOUT
                 )
+                loop = asyncio.get_running_loop()
+                self._command_state_waiter = loop.create_future()
                 _LOGGER.debug("Sending %s command to %s", kind, self.mac)
                 await self._client.write_gatt_char(
                     uuid.UUID(UUID_COMMAND), bytearray(self._encrypt(LOCKER_KIND[kind]))
                 )
-                await asyncio.sleep(NOTIFICATION_WAIT_SECONDS)
-                if self._battery_sensor is not None:
-                    await self._request_battery_on_connection()
+                await self._wait_for_command_result(kind)
             except BleakError as error:
                 _LOGGER.error("BleakError for %s (%s): %s", self.name, self.mac, error)
                 raise
             finally:
+                self._command_state_waiter = None
                 await self._disconnect_client()
 
     async def _time_sync_on_connection(self) -> None:
