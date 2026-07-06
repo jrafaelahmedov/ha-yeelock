@@ -12,7 +12,11 @@ from contextlib import asynccontextmanager
 from time import time
 
 from bleak.exc import BleakError
-from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+from bleak_retry_connector import (
+    BleakClientWithServiceCache,
+    BleakConnectionError,
+    establish_connection,
+)
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS
 from homeassistant.const import CONF_API_KEY, CONF_MAC, CONF_MODEL, CONF_NAME
@@ -21,6 +25,8 @@ from homeassistant.helpers import device_registry as dr
 
 from .const import (
     ACTIVE_SCAN_BURST_SECONDS,
+    ACTIVE_SCAN_SCHEDULE_DURATION,
+    ACTIVE_SCAN_SCHEDULE_INTERVAL,
     ADVERTISEMENT_WAIT_TIMEOUT,
     BLE_SEMAPHORE_KEY,
     COMMAND_FINAL_STATE,
@@ -33,10 +39,12 @@ from .const import (
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
     DOMAIN,
     LOCKER_KIND,
+    LOCKER_FAILURE_COOLDOWN_SECONDS,
     LOCK_ADVERTISEMENT_WAIT_TIMEOUT,
     LOCK_COMMAND_RESULT_TIMEOUT,
     NOTIFICATION_WAIT_SECONDS,
     PRE_CONNECT_DELAY_SECONDS,
+    SERVICE_DISCOVERY_RETRY_AD_TIMEOUT,
     UUID_COMMAND,
     UUID_NOTIFY,
 )
@@ -107,6 +115,7 @@ class Yeelock:
         )
         self._auto_unlock_triggered = False
         self._command_state_waiter: asyncio.Future[str] | None = None
+        self._locker_cooldown_until = 0.0
 
     def _resolve_command_state_waiter(self, new_state: str) -> None:
         """Complete a pending lock/unlock wait when a final state arrives."""
@@ -213,6 +222,8 @@ class Yeelock:
     async def _wait_for_connectable_advertisement(
         self,
         timeout: int | None = None,
+        *,
+        aggressive_scan: bool = False,
     ) -> bluetooth.BluetoothServiceInfoBleak:
         """Wait until the lock sends a fresh connectable advertisement."""
         normalized_mac = self.mac.upper()
@@ -262,11 +273,24 @@ class Yeelock:
             )
             done.set_result(service_info)
 
+        scan_mode = (
+            bluetooth.BluetoothScanningMode.ACTIVE
+            if aggressive_scan
+            else bluetooth.BluetoothScanningMode.PASSIVE
+        )
+        callback_kwargs: dict[str, float] = {}
+        if aggressive_scan:
+            callback_kwargs = {
+                "scan_interval": ACTIVE_SCAN_SCHEDULE_INTERVAL,
+                "scan_duration": ACTIVE_SCAN_SCHEDULE_DURATION,
+            }
+
         remove_callback = bluetooth.async_register_callback(
             self._hass,
             _async_bluetooth_callback,
             {ADDRESS: self.mac},
-            bluetooth.BluetoothScanningMode.PASSIVE,
+            scan_mode,
+            **callback_kwargs,
         )
         deadline = loop.time() + wait_timeout
         try:
@@ -332,11 +356,75 @@ class Yeelock:
 
         return None
 
+    def _prepare_ble_device_for_connect(
+        self,
+        service_info: bluetooth.BluetoothServiceInfoBleak | None = None,
+    ):
+        """Return the freshest connectable BLEDevice for this lock."""
+        try:
+            bluetooth.async_rediscover_address(self._hass, self.mac)
+        except (AttributeError, TypeError):
+            _LOGGER.debug("Address rediscovery unavailable for %s", self.mac)
+
+        ble_device = bluetooth.async_ble_device_from_address(
+            self._hass, self.mac, connectable=True
+        )
+        if ble_device is None and service_info is not None:
+            ble_device = service_info.device
+        if ble_device is not None:
+            self._device = ble_device
+        return ble_device
+
+    async def _establish_yeelock_connection(
+        self,
+        ble_device,
+        *,
+        max_attempts: int = CONNECTION_MAX_ATTEMPTS,
+    ):
+        """Connect to the lock with a single service-discovery retry."""
+        try:
+            return await establish_connection(
+                BleakClientWithServiceCache,
+                ble_device,
+                self.name or self.mac,
+                self._on_disconnect,
+                max_attempts=max_attempts,
+                use_services_cache=True,
+            )
+        except (BleakConnectionError, BleakError) as error:
+            if "discover services" not in str(error).lower():
+                raise
+            _LOGGER.warning(
+                "Lock %s disconnected during service discovery; waking and retrying once",
+                self.name or self.mac,
+            )
+            await self._disconnect_client()
+            await self._trigger_active_scan_burst()
+            service_info = await self._wait_for_connectable_advertisement(
+                timeout=SERVICE_DISCOVERY_RETRY_AD_TIMEOUT,
+                aggressive_scan=True,
+            )
+            await asyncio.sleep(PRE_CONNECT_DELAY_SECONDS)
+            ble_device = self._prepare_ble_device_for_connect(service_info)
+            if ble_device is None:
+                raise BleakError(
+                    f"A device with address {self.mac} could not be found."
+                ) from error
+            return await establish_connection(
+                BleakClientWithServiceCache,
+                ble_device,
+                self.name or self.mac,
+                self._on_disconnect,
+                max_attempts=max_attempts,
+                use_services_cache=True,
+            )
+
     async def _connect(
         self,
         *,
         wait_for_advertisement: bool = True,
         advertisement_timeout: int | None = None,
+        aggressive_scan: bool = False,
     ):
         """Connect to the device.
 
@@ -353,15 +441,11 @@ class Yeelock:
             try:
                 if wait_for_advertisement:
                     service_info = await self._wait_for_connectable_advertisement(
-                        timeout=advertisement_timeout
+                        timeout=advertisement_timeout,
+                        aggressive_scan=aggressive_scan,
                     )
                     await asyncio.sleep(PRE_CONNECT_DELAY_SECONDS)
-                    ble_device = bluetooth.async_ble_device_from_address(
-                        self._hass, self.mac, connectable=True
-                    )
-                    if ble_device is None:
-                        ble_device = service_info.device
-                    self._device = ble_device
+                    ble_device = self._prepare_ble_device_for_connect(service_info)
                 else:
                     ble_device = self._resolve_ble_device()
 
@@ -371,13 +455,7 @@ class Yeelock:
                     )
 
                 _LOGGER.debug("Connecting to %s", self.mac)
-                self._client = await establish_connection(
-                    BleakClientWithServiceCache,
-                    ble_device,
-                    self.name or self.mac,
-                    self._on_disconnect,
-                    max_attempts=CONNECTION_MAX_ATTEMPTS,
-                )
+                self._client = await self._establish_yeelock_connection(ble_device)
                 self._connected = True
                 _LOGGER.debug("Connected to %s", self.mac)
                 await self._client.start_notify(
@@ -521,10 +599,20 @@ class Yeelock:
     async def locker(self, kind) -> None:
         """Lock, unlock and quick unlock the device."""
         self._last_action = kind
+        cooldown_remaining = self._locker_cooldown_until - monotonic_time_coarse()
+        if cooldown_remaining > 0:
+            _LOGGER.info(
+                "Waiting %.0fs for %s adapter to recover before retrying",
+                cooldown_remaining,
+                self.name or self.mac,
+            )
+            await asyncio.sleep(cooldown_remaining)
+
         async with _adapter_session(self._hass):
             try:
                 await self._connect(
-                    advertisement_timeout=LOCK_ADVERTISEMENT_WAIT_TIMEOUT
+                    advertisement_timeout=LOCK_ADVERTISEMENT_WAIT_TIMEOUT,
+                    aggressive_scan=True,
                 )
                 loop = asyncio.get_running_loop()
                 self._command_state_waiter = loop.create_future()
@@ -535,6 +623,13 @@ class Yeelock:
                 await self._wait_for_command_result(kind)
             except BleakError as error:
                 _LOGGER.error("BleakError for %s (%s): %s", self.name, self.mac, error)
+                if any(
+                    marker in str(error).lower()
+                    for marker in ("connection slot", "discover services")
+                ):
+                    self._locker_cooldown_until = (
+                        monotonic_time_coarse() + LOCKER_FAILURE_COOLDOWN_SECONDS
+                    )
                 raise
             finally:
                 self._command_state_waiter = None

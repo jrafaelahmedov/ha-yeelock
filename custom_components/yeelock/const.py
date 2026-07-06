@@ -49,8 +49,15 @@ CONNECTABLE_ADVERTISEMENT_MAX_AGE = 30
 PRE_CONNECT_DELAY_SECONDS = 0.5
 # Active scan burst to wake sleeping locks (seconds).
 ACTIVE_SCAN_BURST_SECONDS = 5
+# Scheduled active scans while waiting for a user lock/unlock action.
+ACTIVE_SCAN_SCHEDULE_INTERVAL = 30.0
+ACTIVE_SCAN_SCHEDULE_DURATION = 10.0
 # Retry BLE connections after an advertisement is observed.
-CONNECTION_MAX_ATTEMPTS = 4
+CONNECTION_MAX_ATTEMPTS = 2
+# Short re-wait after the lock drops during service discovery.
+SERVICE_DISCOVERY_RETRY_AD_TIMEOUT = 20
+# Let the Pi adapter recover after a failed connect before retrying.
+LOCKER_FAILURE_COOLDOWN_SECONDS = 15
 # Wait for the lock to report locked/unlocked after sending a command.
 LOCK_COMMAND_RESULT_TIMEOUT = 8.0
 # Keep the connection open briefly to receive lock state notifications.
