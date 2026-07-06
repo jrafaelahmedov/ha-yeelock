@@ -25,3 +25,10 @@ LOCKER_KIND = {
     "unlock": "01",
     "unlock_quick": "00",
 }
+
+# Wait for a live BLE advertisement before connecting (seconds).
+ADVERTISEMENT_WAIT_TIMEOUT = 20
+# Retry BLE connections; newer HA Bluetooth stacks need more attempts.
+CONNECTION_MAX_ATTEMPTS = 10
+# Keep the connection open briefly to receive lock state notifications.
+NOTIFICATION_WAIT_SECONDS = 1.5

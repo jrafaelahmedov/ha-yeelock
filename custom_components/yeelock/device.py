@@ -7,21 +7,24 @@ import logging
 import uuid
 from time import time
 
-from bleak import BleakClient
 from bleak.exc import BleakError
-from bleak_retry_connector import establish_connection
+from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 from homeassistant.components import bluetooth
+from homeassistant.components.bluetooth.match import ADDRESS
 from homeassistant.const import CONF_API_KEY, CONF_MAC, CONF_MODEL, CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 
 from .const import (
+    ADVERTISEMENT_WAIT_TIMEOUT,
     CONF_AUTO_UNLOCK_LOW_BATTERY,
     CONF_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
+    CONNECTION_MAX_ATTEMPTS,
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY,
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
     DOMAIN,
     LOCKER_KIND,
+    NOTIFICATION_WAIT_SECONDS,
     UUID_COMMAND,
     UUID_NOTIFY,
 )
@@ -86,11 +89,84 @@ class Yeelock:
 
     async def disconnect(self):
         """Disconnect from the device."""
-        _LOGGER.debug("Disconnected from %s", self.mac)
-        if (self._client is not None) and self._client.is_connected:
-            await self._client.disconnect()
+        await self._disconnect_client()
 
-    async def _connect(self):
+    def _on_disconnect(self, _client) -> None:
+        """Handle unexpected disconnects from the lock."""
+        self._client = None
+        self._connected = False
+
+    async def _disconnect_client(self) -> None:
+        """Disconnect and release adapter connection slots."""
+        if self._client is None:
+            self._connected = False
+            return
+
+        client = self._client
+        self._client = None
+        self._connected = False
+        try:
+            if client.is_connected:
+                await client.disconnect()
+        except BleakError as error:
+            _LOGGER.debug("Ignoring disconnect error for %s: %s", self.mac, error)
+
+    async def _wait_for_connectable_advertisement(self) -> None:
+        """Wait until the lock advertises on a connectable scanner."""
+        normalized_mac = self.mac.upper()
+
+        def _process_advertisement(
+            service_info: bluetooth.BluetoothServiceInfoBleak,
+        ) -> bool:
+            return service_info.address.upper() == normalized_mac
+
+        try:
+            service_info = await bluetooth.async_process_advertisements(
+                self._hass,
+                _process_advertisement,
+                {ADDRESS: self.mac},
+                bluetooth.BluetoothScanningMode.ACTIVE,
+                ADVERTISEMENT_WAIT_TIMEOUT,
+            )
+        except TimeoutError as error:
+            diagnostics = bluetooth.async_address_reachability_diagnostics(
+                self._hass, self.mac
+            )
+            _LOGGER.warning(
+                "Lock %s did not advertise within %ss. Diagnostics: %s",
+                self.mac,
+                ADVERTISEMENT_WAIT_TIMEOUT,
+                diagnostics,
+            )
+            raise BleakError(
+                f"Lock {self.mac} did not advertise within "
+                f"{ADVERTISEMENT_WAIT_TIMEOUT}s. Wake the lock in the "
+                "Yeelock app and try again."
+            ) from error
+
+        self._device = service_info.device
+        _LOGGER.debug(
+            "Lock %s advertised (rssi=%s, source=%s)",
+            self.mac,
+            service_info.rssi,
+            service_info.source,
+        )
+
+    def _resolve_ble_device(self):
+        """Return the freshest BLEDevice for this lock."""
+        ble_device = bluetooth.async_ble_device_from_address(
+            self._hass, self.mac, connectable=True
+        )
+        if ble_device is not None:
+            self._device = ble_device
+            return ble_device
+
+        if self._device is not None:
+            return self._device
+
+        return None
+
+    async def _connect(self, *, wait_for_advertisement: bool = True):
         """Connect to the device.
 
         :raises BleakError: if the device is not found
@@ -99,27 +175,37 @@ class Yeelock:
             if self._client is not None and self._client.is_connected:
                 return
 
+            if self._client is not None and not self._client.is_connected:
+                await self._disconnect_client()
+
             self._connecting = True
             try:
-                self._device = bluetooth.async_ble_device_from_address(
-                    self._hass, self.mac, connectable=True
-                )
-                if not self._device:
+                if wait_for_advertisement:
+                    await self._wait_for_connectable_advertisement()
+
+                ble_device = self._resolve_ble_device()
+                if not ble_device:
                     raise BleakError(
                         f"A device with address {self.mac} could not be found."
                     )
+
                 _LOGGER.debug("Connecting to %s", self.mac)
                 self._client = await establish_connection(
-                    BleakClient,
-                    self._device,
-                    self.mac,
-                    max_attempts=3,
+                    BleakClientWithServiceCache,
+                    ble_device,
+                    self.name or self.mac,
+                    self._on_disconnect,
+                    max_attempts=CONNECTION_MAX_ATTEMPTS,
                 )
+                self._connected = True
                 _LOGGER.debug("Connected to %s", self.mac)
                 await self._client.start_notify(
                     uuid.UUID(UUID_NOTIFY), self._handle_data
                 )
                 _LOGGER.debug("Listening for notifications from %s", self.mac)
+            except Exception:
+                await self._disconnect_client()
+                raise
             finally:
                 self._connecting = False
 
@@ -160,7 +246,9 @@ class Yeelock:
             _LOGGER.info("Lock reported time drift; syncing time")
             await self.time_sync()
             if self._last_action:
-                _LOGGER.debug("Retrying last action after time sync: %s", self._last_action)
+                _LOGGER.debug(
+                    "Retrying last action after time sync: %s", self._last_action
+                )
                 await self.locker(self._last_action)
                 self._last_action = None
 
@@ -238,32 +326,38 @@ class Yeelock:
     async def locker(self, kind) -> None:
         """Lock, unlock and quick unlock the device."""
         self._last_action = kind  # Save action before attempting
-        await self._connect()
         try:
-            _LOGGER.debug("Locking")
+            await self._connect()
+            _LOGGER.debug("Sending %s command to %s", kind, self.mac)
             await self._client.write_gatt_char(
                 uuid.UUID(UUID_COMMAND), bytearray(self._encrypt(LOCKER_KIND[kind]))
             )
+            await asyncio.sleep(NOTIFICATION_WAIT_SECONDS)
         except BleakError as error:
-            self._connected = False
             _LOGGER.error("BleakError: %s", error)
+            raise
         finally:
-            # Refresh battery after lock activity when the battery entity exists.
             if self._battery_sensor is not None:
-                await self.update_battery()
+                try:
+                    await self.update_battery()
+                except BleakError as error:
+                    _LOGGER.debug("Battery update after lock action failed: %s", error)
+            await self._disconnect_client()
 
     async def time_sync(self) -> None:
         """Time sync and retry."""
-        await self._connect()
         try:
-            # Sync the time
+            await self._connect(wait_for_advertisement=False)
             _LOGGER.debug("Time sync start")
             await self._client.write_gatt_char(
                 uuid.UUID(UUID_COMMAND), bytearray(self._encrypt_time())
             )
+            await asyncio.sleep(NOTIFICATION_WAIT_SECONDS)
         except BleakError as error:
-            self._connected = False
             _LOGGER.error("BleakError: %s", error)
+            raise
+        finally:
+            await self._disconnect_client()
 
     async def update_battery(self) -> None:
         """Request battery level from the lock over BLE."""
@@ -273,12 +367,15 @@ class Yeelock:
             await self._client.write_gatt_char(
                 uuid.UUID(UUID_COMMAND), bytearray(self._encrypt_battery())
             )
+            await asyncio.sleep(NOTIFICATION_WAIT_SECONDS)
         except BleakError as error:
-            self._connected = False
             _LOGGER.error("BleakError: %s", error)
+            raise
         except Exception as error:  # pragma: no cover - backend-specific transient failures
-            self._connected = False
             _LOGGER.warning("Unable to update battery for %s: %s", self.mac, error)
+            raise
+        finally:
+            await self._disconnect_client()
 
     async def _maybe_auto_unlock_low_battery(self) -> None:
         """Unlock the lock automatically when battery is critically low."""
