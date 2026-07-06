@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import time as time_module
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -16,7 +17,6 @@ from homeassistant.components.bluetooth.match import ADDRESS
 from homeassistant.const import CONF_API_KEY, CONF_MAC, CONF_MODEL, CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
-from homeassistant.util.timeout import monotonic_time_coarse
 
 from .const import (
     ADVERTISEMENT_WAIT_TIMEOUT,
@@ -148,7 +148,7 @@ class Yeelock:
                 return
             if service_info.address.upper() != normalized_mac:
                 return
-            age = monotonic_time_coarse() - service_info.time
+            age = time_module.monotonic() - service_info.time
             if age > FRESH_ADVERTISEMENT_MAX_AGE:
                 _LOGGER.debug(
                     "Ignoring stale advertisement for %s (age=%.1fs)",
