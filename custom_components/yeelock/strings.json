@@ -48,6 +48,13 @@
 					"mac": "MAC Address",
 					"api_key": "[%key:common::config_flow::data::password%]"
 				}
+			},
+			"select_lock": {
+				"title": "Yeelock",
+				"description": "Multiple locks were found in your Yeelock account. Select the lock that matches the discovered Bluetooth device.",
+				"data": {
+					"lock_sn": "Lock"
+				}
 			}
 		}
 	},

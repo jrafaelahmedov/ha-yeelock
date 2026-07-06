@@ -48,6 +48,13 @@
 					"mac": "Endereço MAC",
 					"api_key": "Chave de API"
 				}
+			},
+			"select_lock": {
+				"title": "Yeelock",
+				"description": "Foram encontradas várias fechaduras na sua conta Yeelock. Selecione a fechadura que corresponde ao dispositivo Bluetooth descoberto.",
+				"data": {
+					"lock_sn": "Fechadura"
+				}
 			}
 		}
 	},

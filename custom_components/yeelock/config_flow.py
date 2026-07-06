@@ -41,6 +41,18 @@ CONF_ACCOUNT_TYPE = "account_type"
 ACCOUNT_TYPE_EMAIL = "email"
 ACCOUNT_TYPE_PHONE = "phone"
 CONF_ACCOUNT_ID = "account_id"
+CONF_LOCK_SN = "lock_sn"
+
+LOCK_IDENTIFIER_FIELDS = (
+    "sn",
+    "name",
+    "mac",
+    "ble_mac",
+    "bluetooth_mac",
+    "bt_mac",
+    "device_sn",
+    "serial",
+)
 
 ACCOUNT_STORE_KEY = f"{DOMAIN}_accounts"
 ACCOUNT_STORE_VERSION = 1
@@ -68,7 +80,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry: config_entries.ConfigEntry,
     ) -> YeelockOptionsFlow:
         """Create the options flow."""
-        return YeelockOptionsFlow(config_entry)
+        return YeelockOptionsFlow()
 
     def __init__(self) -> None:
         """Initialize Yeelock config flow."""
@@ -76,6 +88,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._discovery_info: BluetoothServiceInfoBleak | None = None
         self._discovered_devices: dict[str, BluetoothServiceInfoBleak] = {}
         self._account_type: str = ACCOUNT_TYPE_EMAIL
+        self._pending_cloud_input: dict[str, Any] | None = None
+        self._unconfigured_locks: dict[str, dict[str, Any]] = {}
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
@@ -205,6 +219,75 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             normalized = normalized.removeprefix("EL_")
         return normalized.replace(":", "").replace("-", "").replace("_", "")
 
+    def _get_configured_identifiers(self) -> set[str]:
+        """Return normalized identifiers for locks already configured in HA."""
+        configured: set[str] = set()
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            configured.add(self._normalize_identifier(entry.unique_id))
+            configured.add(self._normalize_identifier(entry.data.get(CONF_MAC)))
+        configured.discard("")
+        return configured
+
+    def _get_lock_identifiers(self, lock: dict[str, Any]) -> set[str]:
+        """Collect normalized identifiers for a cloud lock."""
+        identifiers = {
+            self._normalize_identifier(lock.get(field))
+            for field in LOCK_IDENTIFIER_FIELDS
+        }
+        identifiers.discard("")
+        return identifiers
+
+    def _is_lock_already_configured(self, lock: dict[str, Any]) -> bool:
+        """Return whether the cloud lock is already configured in HA."""
+        configured = self._get_configured_identifiers()
+        return bool(self._get_lock_identifiers(lock) & configured)
+
+    async def _async_fetch_cloud_locks(self, token: str) -> list[dict[str, Any]]:
+        """Return all locks from the Yeelock cloud account."""
+        locks_response = await self._api_wrapper(
+            method="get",
+            url="https://api.yeeloc.com/v2/user/device/list",
+            params={"group_id": -1},
+            headers={
+                "Accept": "*/*",
+                "Authorization": token,
+            },
+        )
+        locks = locks_response.get("data", [])
+        if not isinstance(locks, list):
+            return []
+        return locks
+
+    async def _async_get_unconfigured_locks(
+        self, token: str
+    ) -> list[dict[str, Any]]:
+        """Return cloud locks that are not yet configured in HA."""
+        return [
+            lock
+            for lock in await self._async_fetch_cloud_locks(token)
+            if not self._is_lock_already_configured(lock)
+        ]
+
+    def _build_entry_data_from_lock(
+        self,
+        lock: dict[str, Any],
+        *,
+        account_id: str,
+        address: str,
+        auto_unlock_low_battery: bool,
+        auto_unlock_low_battery_threshold: int,
+    ) -> dict[str, Any]:
+        """Build config entry data from a matched cloud lock."""
+        return {
+            CONF_ACCOUNT_ID: account_id,
+            CONF_AUTO_UNLOCK_LOW_BATTERY: auto_unlock_low_battery,
+            CONF_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD: auto_unlock_low_battery_threshold,
+            CONF_MAC: address,
+            CONF_NAME: lock["name"],
+            CONF_MODEL: lock["type"],
+            CONF_API_KEY: lock["ble_sign_key"],
+        }
+
     async def _async_try_auto_configure_from_saved_account(self) -> FlowResult | None:
         """Try to configure from previously saved credentials."""
         if not self._discovery_info or not self._discovery_info.address:
@@ -271,35 +354,21 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if not self._discovery_info:
             return None
 
-        locks_response = await self._api_wrapper(
-            method="get",
-            url="https://api.yeeloc.com/v2/user/device/list",
-            params={"group_id": -1},
-            headers={
-                "Accept": "*/*",
-                "Authorization": token,
-            },
-        )
-
-        locks = locks_response.get("data", [])
-        _LOGGER.debug(locks_response)
+        locks = await self._async_fetch_cloud_locks(token)
+        _LOGGER.debug("Fetched %s cloud lock(s)", len(locks))
         discovered_name = self._discovery_info.name
         discovered_address = self._discovery_info.address
         normalized_discovered_name = self._normalize_identifier(discovered_name)
         normalized_discovered_address = self._normalize_identifier(discovered_address)
-        if not discovered_name:
-            _LOGGER.debug("Unable to match lock: discovered bluetooth device name is missing")
+        if not discovered_name and not discovered_address:
+            _LOGGER.debug("Unable to match lock: discovered bluetooth identifiers are missing")
+            return None
 
         for lock in locks:
-            lock_identifiers = {
-                self._normalize_identifier(lock.get("sn")),
-                self._normalize_identifier(lock.get("name")),
-                self._normalize_identifier(lock.get("mac")),
-                self._normalize_identifier(lock.get("ble_mac")),
-                self._normalize_identifier(lock.get("bluetooth_mac")),
-                self._normalize_identifier(lock.get("bt_mac")),
-            }
-            lock_identifiers.discard("")
+            if self._is_lock_already_configured(lock):
+                continue
+
+            lock_identifiers = self._get_lock_identifiers(lock)
 
             if (
                 normalized_discovered_name
@@ -309,6 +378,19 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 and normalized_discovered_address in lock_identifiers
             ):
                 return lock
+
+        unconfigured_names = [
+            lock.get("name") or lock.get("sn")
+            for lock in locks
+            if not self._is_lock_already_configured(lock)
+        ]
+        _LOGGER.warning(
+            "Could not match discovered lock (name=%s, address=%s) to an "
+            "unconfigured cloud lock. Unconfigured locks in account: %s",
+            discovered_name,
+            discovered_address,
+            unconfigured_names or "none",
+        )
         return None
 
     async def async_step_account_type(
@@ -408,6 +490,43 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     account, user_input[CONF_PASSWORD]
                 )
                 lock = await self._async_get_matching_lock(token)
+                if not lock:
+                    unconfigured_locks = await self._async_get_unconfigured_locks(token)
+                    if len(unconfigured_locks) == 1:
+                        lock = unconfigured_locks[0]
+                        _LOGGER.info(
+                            "Using the only unconfigured cloud lock: %s",
+                            lock.get("name") or lock.get("sn"),
+                        )
+                    elif len(unconfigured_locks) > 1:
+                        account_id = self._build_account_id(account)
+                        account_data = {
+                            CONF_ACCOUNT_ID: account_id,
+                            CONF_PHONE: user_input[CONF_PHONE],
+                            CONF_PASSWORD: user_input[CONF_PASSWORD],
+                        }
+                        if is_phone:
+                            account_data[CONF_COUNTRY_CODE] = user_input[CONF_COUNTRY_CODE]
+                        await self._async_save_account_data(account_data)
+                        self._pending_cloud_input = {
+                            CONF_ACCOUNT_ID: account_id,
+                            CONF_AUTO_UNLOCK_LOW_BATTERY: user_input.get(
+                                CONF_AUTO_UNLOCK_LOW_BATTERY,
+                                DEFAULT_AUTO_UNLOCK_LOW_BATTERY,
+                            ),
+                            CONF_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD: user_input.get(
+                                CONF_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
+                                DEFAULT_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
+                            ),
+                            CONF_MAC: address,
+                        }
+                        self._unconfigured_locks = {
+                            lock_item["sn"]: lock_item
+                            for lock_item in unconfigured_locks
+                            if lock_item.get("sn")
+                        }
+                        return await self.async_step_select_lock()
+
                 if lock:
                     _LOGGER.debug("Found lock and key")
                     account_id = self._build_account_id(account)
@@ -420,21 +539,19 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         account_data[CONF_COUNTRY_CODE] = user_input[CONF_COUNTRY_CODE]
                     await self._async_save_account_data(account_data)
 
-                    entry_data: dict[str, Any] = {
-                        CONF_ACCOUNT_ID: account_id,
-                        CONF_AUTO_UNLOCK_LOW_BATTERY: user_input.get(
+                    entry_data = self._build_entry_data_from_lock(
+                        lock,
+                        account_id=account_id,
+                        address=address,
+                        auto_unlock_low_battery=user_input.get(
                             CONF_AUTO_UNLOCK_LOW_BATTERY,
                             DEFAULT_AUTO_UNLOCK_LOW_BATTERY,
                         ),
-                        CONF_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD: user_input.get(
+                        auto_unlock_low_battery_threshold=user_input.get(
                             CONF_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
                             DEFAULT_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
                         ),
-                    }
-                    entry_data[CONF_MAC] = address
-                    entry_data[CONF_NAME] = lock["name"]
-                    entry_data[CONF_MODEL] = lock["type"]
-                    entry_data[CONF_API_KEY] = lock["ble_sign_key"]
+                    )
 
                     return self.async_create_entry(
                         title=entry_data[CONF_NAME], data=entry_data
@@ -460,6 +577,44 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 data_schema=self._schema,
                 errors=errors,
             )
+
+    async def async_step_select_lock(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Let the user choose which cloud lock matches the discovered device."""
+        if not self._pending_cloud_input or not self._unconfigured_locks:
+            return self.async_abort(reason="no_devices_found")
+
+        if user_input is not None:
+            lock = self._unconfigured_locks.get(user_input[CONF_LOCK_SN])
+            if lock:
+                entry_data = self._build_entry_data_from_lock(
+                    lock,
+                    account_id=self._pending_cloud_input[CONF_ACCOUNT_ID],
+                    address=self._pending_cloud_input[CONF_MAC],
+                    auto_unlock_low_battery=self._pending_cloud_input[
+                        CONF_AUTO_UNLOCK_LOW_BATTERY
+                    ],
+                    auto_unlock_low_battery_threshold=self._pending_cloud_input[
+                        CONF_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD
+                    ],
+                )
+                return self.async_create_entry(
+                    title=entry_data[CONF_NAME], data=entry_data
+                )
+
+        lock_choices = {
+            sn: lock.get("name") or sn
+            for sn, lock in self._unconfigured_locks.items()
+        }
+        return self.async_show_form(
+            step_id="select_lock",
+            data_schema=voluptuous.Schema(
+                {
+                    voluptuous.Required(CONF_LOCK_SN): voluptuous.In(lock_choices),
+                }
+            ),
+        )
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -530,10 +685,6 @@ class YeelockAccountNotRegisteredError(YeelockAuthError):
 
 class YeelockOptionsFlow(config_entries.OptionsFlowWithReload):
     """Handle options for Yeelock."""
-
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
-        super().__init__(config_entry)
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
