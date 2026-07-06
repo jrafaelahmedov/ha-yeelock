@@ -3,6 +3,7 @@
 from homeassistant.const import Platform
 
 DOMAIN = "yeelock"
+BLE_SEMAPHORE_KEY = "_ble_semaphore"
 
 PLATFORMS: list[str] = [
     Platform.LOCK,
@@ -27,10 +28,12 @@ LOCKER_KIND = {
 }
 
 # Wait for a live BLE advertisement before connecting (seconds).
-ADVERTISEMENT_WAIT_TIMEOUT = 30
+ADVERTISEMENT_WAIT_TIMEOUT = 20
 # Only connect after an advertisement at most this many seconds old.
-FRESH_ADVERTISEMENT_MAX_AGE = 5
-# Retry BLE connections; newer HA Bluetooth stacks need more attempts.
-CONNECTION_MAX_ATTEMPTS = 10
+FRESH_ADVERTISEMENT_MAX_AGE = 10
+# Retry BLE connections after a fresh advertisement is observed.
+CONNECTION_MAX_ATTEMPTS = 6
 # Keep the connection open briefly to receive lock state notifications.
-NOTIFICATION_WAIT_SECONDS = 1.5
+NOTIFICATION_WAIT_SECONDS = 1.0
+# Defer startup battery reads so multiple locks do not fight at boot.
+STARTUP_BATTERY_DELAY = 90

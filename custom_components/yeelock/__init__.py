@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    BLE_SEMAPHORE_KEY,
     CONF_AUTO_UNLOCK_LOW_BATTERY,
     CONF_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY,
@@ -25,6 +27,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Yeelock from a config entry."""
     if DOMAIN not in hass.data:
         hass.data[DOMAIN] = {}
+    if BLE_SEMAPHORE_KEY not in hass.data[DOMAIN]:
+        hass.data[DOMAIN][BLE_SEMAPHORE_KEY] = asyncio.Lock()
     config = {
         **entry.data,
         **entry.options,

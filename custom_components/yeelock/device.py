@@ -5,6 +5,8 @@ import hashlib
 import hmac
 import logging
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from time import time
 
 from bleak.exc import BleakError
@@ -18,6 +20,7 @@ from homeassistant.util.timeout import monotonic_time_coarse
 
 from .const import (
     ADVERTISEMENT_WAIT_TIMEOUT,
+    BLE_SEMAPHORE_KEY,
     CONF_AUTO_UNLOCK_LOW_BATTERY,
     CONF_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
     CONNECTION_MAX_ATTEMPTS,
@@ -33,6 +36,14 @@ from .const import (
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _adapter_session(hass: HomeAssistant) -> AsyncIterator[None]:
+    """Serialize Yeelock BLE access across all locks on one adapter."""
+    adapter_lock: asyncio.Lock = hass.data[DOMAIN][BLE_SEMAPHORE_KEY]
+    async with adapter_lock:
+        yield
 
 
 class YeelockDeviceEntity:
@@ -121,6 +132,13 @@ class Yeelock:
         loop = asyncio.get_running_loop()
         done: asyncio.Future[bluetooth.BluetoothServiceInfoBleak] = loop.create_future()
 
+        _LOGGER.info(
+            "Waiting up to %ss for %s (%s) to advertise",
+            ADVERTISEMENT_WAIT_TIMEOUT,
+            self.name or self.mac,
+            self.mac,
+        )
+
         @callback
         def _async_bluetooth_callback(
             service_info: bluetooth.BluetoothServiceInfoBleak,
@@ -160,8 +178,9 @@ class Yeelock:
                 self._hass, self.mac
             )
             _LOGGER.warning(
-                "Lock %s did not send a fresh advertisement within %ss. "
+                "Lock %s (%s) did not send a fresh advertisement within %ss. "
                 "Diagnostics: %s",
+                self.name or self.mac,
                 self.mac,
                 ADVERTISEMENT_WAIT_TIMEOUT,
                 diagnostics,
@@ -234,6 +253,16 @@ class Yeelock:
             finally:
                 self._connecting = False
 
+    async def _request_battery_on_connection(self) -> None:
+        """Request battery level on the active BLE connection."""
+        if self._client is None or not self._client.is_connected:
+            return
+        _LOGGER.debug("Requesting battery level for %s", self.mac)
+        await self._client.write_gatt_char(
+            uuid.UUID(UUID_COMMAND), bytearray(self._encrypt_battery())
+        )
+        await asyncio.sleep(NOTIFICATION_WAIT_SECONDS)
+
     async def _handle_data(self, sender, value):
         """Handle data notifications."""
         _LOGGER.debug("Received notification from %s (len=%s)", sender, len(value))
@@ -263,18 +292,21 @@ class Yeelock:
         # Lock change failures
         # Invalid signing key
         elif first_byte == 0xFF:
-            _LOGGER.error("Invalid signing key")
+            _LOGGER.error("Invalid signing key for %s (%s)", self.name, self.mac)
             new_state = "jammed"
 
         # Time needs to be synced
         elif first_byte == 0x9:
             _LOGGER.info("Lock reported time drift; syncing time")
-            await self.time_sync()
+            await self._time_sync_on_connection()
             if self._last_action:
                 _LOGGER.debug(
                     "Retrying last action after time sync: %s", self._last_action
                 )
-                await self.locker(self._last_action)
+                await self._client.write_gatt_char(
+                    uuid.UUID(UUID_COMMAND),
+                    bytearray(self._encrypt(LOCKER_KIND[self._last_action])),
+                )
                 self._last_action = None
 
         # Battery response notification
@@ -350,59 +382,63 @@ class Yeelock:
 
     async def locker(self, kind) -> None:
         """Lock, unlock and quick unlock the device."""
-        self._last_action = kind  # Save action before attempting
-        command_sent = False
-        try:
-            await self._connect()
-            _LOGGER.debug("Sending %s command to %s", kind, self.mac)
-            await self._client.write_gatt_char(
-                uuid.UUID(UUID_COMMAND), bytearray(self._encrypt(LOCKER_KIND[kind]))
-            )
-            command_sent = True
-            await asyncio.sleep(NOTIFICATION_WAIT_SECONDS)
-        except BleakError as error:
-            _LOGGER.error("BleakError: %s", error)
-            raise
-        finally:
-            if command_sent and self._battery_sensor is not None:
-                try:
-                    await self.update_battery()
-                except BleakError as error:
-                    _LOGGER.debug("Battery update after lock action failed: %s", error)
-            await self._disconnect_client()
+        self._last_action = kind
+        async with _adapter_session(self._hass):
+            try:
+                await self._connect()
+                _LOGGER.debug("Sending %s command to %s", kind, self.mac)
+                await self._client.write_gatt_char(
+                    uuid.UUID(UUID_COMMAND), bytearray(self._encrypt(LOCKER_KIND[kind]))
+                )
+                await asyncio.sleep(NOTIFICATION_WAIT_SECONDS)
+                if self._battery_sensor is not None:
+                    await self._request_battery_on_connection()
+            except BleakError as error:
+                _LOGGER.error("BleakError for %s (%s): %s", self.name, self.mac, error)
+                raise
+            finally:
+                await self._disconnect_client()
+
+    async def _time_sync_on_connection(self) -> None:
+        """Sync time on the active BLE connection."""
+        if self._client is None or not self._client.is_connected:
+            return
+        _LOGGER.debug("Time sync start for %s", self.mac)
+        await self._client.write_gatt_char(
+            uuid.UUID(UUID_COMMAND), bytearray(self._encrypt_time())
+        )
+        await asyncio.sleep(NOTIFICATION_WAIT_SECONDS)
 
     async def time_sync(self) -> None:
         """Time sync and retry."""
-        try:
-            await self._connect(wait_for_advertisement=False)
-            _LOGGER.debug("Time sync start")
-            await self._client.write_gatt_char(
-                uuid.UUID(UUID_COMMAND), bytearray(self._encrypt_time())
-            )
-            await asyncio.sleep(NOTIFICATION_WAIT_SECONDS)
-        except BleakError as error:
-            _LOGGER.error("BleakError: %s", error)
-            raise
-        finally:
-            await self._disconnect_client()
+        if self._client is not None and self._client.is_connected:
+            await self._time_sync_on_connection()
+            return
+
+        async with _adapter_session(self._hass):
+            try:
+                await self._connect(wait_for_advertisement=False)
+                await self._time_sync_on_connection()
+            except BleakError as error:
+                _LOGGER.error("BleakError: %s", error)
+                raise
+            finally:
+                await self._disconnect_client()
 
     async def update_battery(self) -> None:
         """Request battery level from the lock over BLE."""
-        try:
-            await self._connect()
-            _LOGGER.debug("Requesting battery level")
-            await self._client.write_gatt_char(
-                uuid.UUID(UUID_COMMAND), bytearray(self._encrypt_battery())
-            )
-            await asyncio.sleep(NOTIFICATION_WAIT_SECONDS)
-        except BleakError as error:
-            _LOGGER.error("BleakError: %s", error)
-            raise
-        except Exception as error:  # pragma: no cover - backend-specific transient failures
-            _LOGGER.warning("Unable to update battery for %s: %s", self.mac, error)
-            raise
-        finally:
-            await self._disconnect_client()
+        async with _adapter_session(self._hass):
+            try:
+                await self._connect()
+                await self._request_battery_on_connection()
+            except BleakError as error:
+                _LOGGER.error("BleakError: %s", error)
+                raise
+            except Exception as error:  # pragma: no cover - backend-specific transient failures
+                _LOGGER.warning("Unable to update battery for %s: %s", self.mac, error)
+                raise
+            finally:
+                await self._disconnect_client()
 
     async def _maybe_auto_unlock_low_battery(self) -> None:
         """Unlock the lock automatically when battery is critically low."""
@@ -430,4 +466,4 @@ class Yeelock:
             self.auto_unlock_low_battery_threshold,
         )
         self._auto_unlock_triggered = True
-        await self.locker("unlock")
+        self._hass.async_create_task(self.locker("unlock"))
