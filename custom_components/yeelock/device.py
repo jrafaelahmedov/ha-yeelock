@@ -174,9 +174,17 @@ class Yeelock:
         try:
             return await asyncio.wait_for(done, timeout=ADVERTISEMENT_WAIT_TIMEOUT)
         except TimeoutError as error:
-            diagnostics = bluetooth.async_address_reachability_diagnostics(
-                self._hass, self.mac
-            )
+            diagnostics = "unavailable"
+            try:
+                diagnostics = bluetooth.async_address_reachability_diagnostics(
+                    self._hass,
+                    self.mac,
+                    bluetooth.BluetoothReachabilityIntent.CONNECTION,
+                )
+            except (TypeError, AttributeError):
+                _LOGGER.debug(
+                    "Reachability diagnostics unavailable for %s", self.mac
+                )
             _LOGGER.warning(
                 "Lock %s (%s) did not send a fresh advertisement within %ss. "
                 "Diagnostics: %s",
