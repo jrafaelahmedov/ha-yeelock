@@ -455,6 +455,16 @@ class Yeelock:
                         f"A device with address {self.mac} could not be found."
                     )
 
+                try:
+                    await close_stale_connections_by_address(self.mac)
+                except Exception as cleanup_error:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "[%s] %s: pre-connect stale cleanup failed: %s",
+                        op_id,
+                        self.name or self.mac,
+                        cleanup_error,
+                    )
+
                 connect_start = monotonic_time_coarse()
                 _LOGGER.debug("[%s] Connecting to %s", op_id, self.mac)
                 try:
