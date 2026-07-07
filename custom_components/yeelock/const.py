@@ -62,6 +62,11 @@ LOCKER_FAILURE_COOLDOWN_SECONDS = 20
 # attempt; its internal out-of-slots backoff can otherwise run for over
 # a minute by itself, well past our own retry/backoff budget.
 CONNECT_PHASE_TIMEOUT = 30
+# Longer cooldown after WE cancel a stuck connect attempt (CONNECT_PHASE_TIMEOUT).
+# BlueZ/the controller may keep working on that abandoned attempt in the
+# background for a while after we walk away, so give it extra time before
+# our own retry grabs the same slot again.
+CONNECT_TIMEOUT_COOLDOWN_SECONDS = 40
 # Wait for the lock to report locked/unlocked after sending a command.
 LOCK_COMMAND_RESULT_TIMEOUT = 8.0
 # Keep the connection open briefly to receive lock state notifications.

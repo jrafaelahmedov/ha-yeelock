@@ -15,6 +15,7 @@ from bleak.exc import BleakError
 from bleak_retry_connector import (
     BleakClientWithServiceCache,
     BleakConnectionError,
+    close_stale_connections_by_address,
     establish_connection,
 )
 from homeassistant.components import bluetooth
@@ -34,6 +35,7 @@ from .const import (
     CONNECTABLE_ADVERTISEMENT_MAX_AGE,
     CONNECTION_MAX_ATTEMPTS,
     CONNECT_PHASE_TIMEOUT,
+    CONNECT_TIMEOUT_COOLDOWN_SECONDS,
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY,
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
     DOMAIN,
@@ -695,8 +697,26 @@ class Yeelock:
                         monotonic_time_coarse() - op_start,
                         error,
                     )
-                    if any(
-                        marker in str(error).lower()
+                    error_text = str(error).lower()
+                    if "connect timeout" in error_text:
+                        # We gave up waiting, but BlueZ/the controller may
+                        # still be working on the abandoned attempt in the
+                        # background. Proactively ask BlueZ to drop it and
+                        # cool down longer before grabbing that slot again.
+                        try:
+                            await close_stale_connections_by_address(self.mac)
+                        except Exception as cleanup_error:  # noqa: BLE001
+                            _LOGGER.debug(
+                                "[%s] %s: stale connection cleanup failed: %s",
+                                op_id,
+                                self.name or self.mac,
+                                cleanup_error,
+                            )
+                        self._locker_cooldown_until = (
+                            monotonic_time_coarse() + CONNECT_TIMEOUT_COOLDOWN_SECONDS
+                        )
+                    elif any(
+                        marker in error_text
                         for marker in ("connection slot", "discover services", "timeout")
                     ):
                         self._locker_cooldown_until = (
