@@ -44,7 +44,10 @@ ADVERTISEMENT_WAIT_TIMEOUT = 30
 # User lock/unlock actions wait longer because Yeelocks advertise infrequently.
 LOCK_ADVERTISEMENT_WAIT_TIMEOUT = 45
 # HA connectable history needs a recent advertisement (seconds).
-CONNECTABLE_ADVERTISEMENT_MAX_AGE = 30
+# HA's own habluetooth stack considers connectable ads valid for ~195s;
+# our stricter cutoff avoids using ancient data while still accepting
+# a "just missed" advertisement instead of forcing a full new wait.
+CONNECTABLE_ADVERTISEMENT_MAX_AGE = 90
 # Pause after stopping active scans before opening a connection.
 PRE_CONNECT_DELAY_SECONDS = 0.5
 # Active scan burst to wake sleeping locks (seconds).
@@ -55,6 +58,10 @@ CONNECTION_MAX_ATTEMPTS = 3
 SERVICE_DISCOVERY_RETRY_AD_TIMEOUT = 20
 # Let the Pi adapter fully release a BlueZ connection slot before retrying.
 LOCKER_FAILURE_COOLDOWN_SECONDS = 20
+# Bound how long we let bleak_retry_connector churn on a single connect
+# attempt; its internal out-of-slots backoff can otherwise run for over
+# a minute by itself, well past our own retry/backoff budget.
+CONNECT_PHASE_TIMEOUT = 30
 # Wait for the lock to report locked/unlocked after sending a command.
 LOCK_COMMAND_RESULT_TIMEOUT = 8.0
 # Keep the connection open briefly to receive lock state notifications.

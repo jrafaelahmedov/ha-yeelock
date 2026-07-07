@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
-from .const import DOMAIN
+from .const import COMMAND_TRANSITIONAL_STATE, DOMAIN
 from .device import Yeelock, YeelockDeviceEntity
 
 
@@ -79,10 +79,14 @@ class YeelockLock(YeelockDeviceEntity, LockEntity, RestoreEntity):
     async def _run_lock_command(self, kind: str) -> None:
         """Run a lock command and recover from stale transitional states."""
         previous_state = self._attr_state
+        already_busy = self.device._active_op_kind is not None
+        if not already_busy:
+            self._attr_state = COMMAND_TRANSITIONAL_STATE[kind]
+            self.async_write_ha_state()
         try:
             await self.device.locker(kind)
         except (BleakError, TimeoutError) as error:
-            if self._attr_state in _TRANSIENT_STATES:
+            if not already_busy and self._attr_state in _TRANSIENT_STATES:
                 self._attr_state = (
                     previous_state
                     if previous_state not in _TRANSIENT_STATES

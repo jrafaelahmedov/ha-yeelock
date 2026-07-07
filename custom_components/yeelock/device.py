@@ -33,6 +33,7 @@ from .const import (
     CONF_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
     CONNECTABLE_ADVERTISEMENT_MAX_AGE,
     CONNECTION_MAX_ATTEMPTS,
+    CONNECT_PHASE_TIMEOUT,
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY,
     DEFAULT_AUTO_UNLOCK_LOW_BATTERY_THRESHOLD,
     DOMAIN,
@@ -114,6 +115,7 @@ class Yeelock:
         self._auto_unlock_triggered = False
         self._command_state_waiter: asyncio.Future[str] | None = None
         self._locker_cooldown_until = 0.0
+        self._active_op_kind: str | None = None
 
     def _resolve_command_state_waiter(self, new_state: str) -> None:
         """Complete a pending lock/unlock wait when a final state arrives."""
@@ -453,9 +455,16 @@ class Yeelock:
 
                 connect_start = monotonic_time_coarse()
                 _LOGGER.debug("[%s] Connecting to %s", op_id, self.mac)
-                self._client = await self._establish_yeelock_connection(
-                    ble_device, op_id=op_id
-                )
+                try:
+                    self._client = await asyncio.wait_for(
+                        self._establish_yeelock_connection(ble_device, op_id=op_id),
+                        timeout=CONNECT_PHASE_TIMEOUT,
+                    )
+                except TimeoutError as error:
+                    raise BleakError(
+                        f"Connect timeout: {self.mac} did not connect within "
+                        f"{CONNECT_PHASE_TIMEOUT:.0f}s (adapter likely congested)"
+                    ) from error
                 self._connected = True
                 _LOGGER.info(
                     "[%s] %s: BLE connected after %.1fs",
@@ -612,76 +621,93 @@ class Yeelock:
 
     async def locker(self, kind) -> None:
         """Lock, unlock and quick unlock the device."""
+        if self._active_op_kind is not None:
+            _LOGGER.info(
+                "%s: ignoring %s request, %s is already in progress",
+                self.name or self.mac,
+                kind,
+                self._active_op_kind,
+            )
+            raise BleakError(
+                f"{self.name or self.mac} is already processing "
+                f"{self._active_op_kind}; please wait for it to finish "
+                "instead of pressing again."
+            )
+
         self._last_action = kind
+        self._active_op_kind = kind
         op_id = uuid.uuid4().hex[:8]
         op_start = monotonic_time_coarse()
 
-        cooldown_remaining = self._locker_cooldown_until - op_start
-        if cooldown_remaining > 0:
-            _LOGGER.info(
-                "[%s] %s: waiting %.0fs for adapter to recover before retrying",
-                op_id,
-                self.name or self.mac,
-                cooldown_remaining,
-            )
-            await asyncio.sleep(cooldown_remaining)
-
-        _LOGGER.info("[%s] %s: %s requested", op_id, self.name or self.mac, kind)
-
-        async with _adapter_session(self._hass):
-            try:
-                await self._connect(
-                    advertisement_timeout=LOCK_ADVERTISEMENT_WAIT_TIMEOUT,
-                    op_id=op_id,
+        try:
+            cooldown_remaining = self._locker_cooldown_until - op_start
+            if cooldown_remaining > 0:
+                _LOGGER.info(
+                    "[%s] %s: waiting %.0fs for adapter to recover before retrying",
+                    op_id,
+                    self.name or self.mac,
+                    cooldown_remaining,
                 )
+                await asyncio.sleep(cooldown_remaining)
+
+            _LOGGER.info("[%s] %s: %s requested", op_id, self.name or self.mac, kind)
+
+            async with _adapter_session(self._hass):
                 try:
-                    await self._send_lock_command(kind, op_id)
-                except BleakError as error:
-                    if not any(
-                        marker in str(error).lower()
-                        for marker in ("unlikely", "protocol error")
-                    ):
-                        raise
-                    _LOGGER.warning(
-                        "[%s] %s: GATT protocol error, reconnecting and retrying once: %s",
-                        op_id,
-                        self.name or self.mac,
-                        error,
-                    )
-                    await self._disconnect_client()
                     await self._connect(
-                        advertisement_timeout=SERVICE_DISCOVERY_RETRY_AD_TIMEOUT,
+                        advertisement_timeout=LOCK_ADVERTISEMENT_WAIT_TIMEOUT,
                         op_id=op_id,
                     )
-                    await self._send_lock_command(kind, op_id)
-                await self._wait_for_command_result(kind)
-                _LOGGER.info(
-                    "[%s] %s: %s confirmed after %.1fs total",
-                    op_id,
-                    self.name or self.mac,
-                    kind,
-                    monotonic_time_coarse() - op_start,
-                )
-            except BleakError as error:
-                _LOGGER.error(
-                    "[%s] %s: %s failed after %.1fs: %s",
-                    op_id,
-                    self.name or self.mac,
-                    kind,
-                    monotonic_time_coarse() - op_start,
-                    error,
-                )
-                if any(
-                    marker in str(error).lower()
-                    for marker in ("connection slot", "discover services", "timeout")
-                ):
-                    self._locker_cooldown_until = (
-                        monotonic_time_coarse() + LOCKER_FAILURE_COOLDOWN_SECONDS
+                    try:
+                        await self._send_lock_command(kind, op_id)
+                    except BleakError as error:
+                        if not any(
+                            marker in str(error).lower()
+                            for marker in ("unlikely", "protocol error")
+                        ):
+                            raise
+                        _LOGGER.warning(
+                            "[%s] %s: GATT protocol error, reconnecting and retrying once: %s",
+                            op_id,
+                            self.name or self.mac,
+                            error,
+                        )
+                        await self._disconnect_client()
+                        await self._connect(
+                            advertisement_timeout=SERVICE_DISCOVERY_RETRY_AD_TIMEOUT,
+                            op_id=op_id,
+                        )
+                        await self._send_lock_command(kind, op_id)
+                    await self._wait_for_command_result(kind)
+                    _LOGGER.info(
+                        "[%s] %s: %s confirmed after %.1fs total",
+                        op_id,
+                        self.name or self.mac,
+                        kind,
+                        monotonic_time_coarse() - op_start,
                     )
-                raise
-            finally:
-                self._command_state_waiter = None
-                await self._disconnect_client()
+                except BleakError as error:
+                    _LOGGER.error(
+                        "[%s] %s: %s failed after %.1fs: %s",
+                        op_id,
+                        self.name or self.mac,
+                        kind,
+                        monotonic_time_coarse() - op_start,
+                        error,
+                    )
+                    if any(
+                        marker in str(error).lower()
+                        for marker in ("connection slot", "discover services", "timeout")
+                    ):
+                        self._locker_cooldown_until = (
+                            monotonic_time_coarse() + LOCKER_FAILURE_COOLDOWN_SECONDS
+                        )
+                    raise
+                finally:
+                    self._command_state_waiter = None
+                    await self._disconnect_client()
+        finally:
+            self._active_op_kind = None
 
     async def _time_sync_on_connection(self) -> None:
         """Sync time on the active BLE connection."""
