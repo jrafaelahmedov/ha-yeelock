@@ -220,24 +220,28 @@ class Yeelock:
     async def _wait_for_connectable_advertisement(
         self,
         timeout: int | None = None,
+        op_id: str = "-",
     ) -> bluetooth.BluetoothServiceInfoBleak:
         """Wait until the lock sends a fresh connectable advertisement."""
         normalized_mac = self.mac.upper()
         wait_timeout = timeout or ADVERTISEMENT_WAIT_TIMEOUT
+        wait_start = monotonic_time_coarse()
         loop = asyncio.get_running_loop()
         done: asyncio.Future[bluetooth.BluetoothServiceInfoBleak] = loop.create_future()
 
         _LOGGER.info(
-            "Waiting up to %ss for %s (%s) to advertise",
-            wait_timeout,
+            "[%s] %s (%s): waiting up to %ss for advertisement",
+            op_id,
             self.name or self.mac,
             self.mac,
+            wait_timeout,
         )
 
         fresh = self._fresh_service_info()
         if fresh:
-            _LOGGER.debug(
-                "Using recent advertisement for %s (age=%.1fs)",
+            _LOGGER.info(
+                "[%s] %s: using cached advertisement (age=%.1fs, no wait needed)",
+                op_id,
                 self.mac,
                 self._advertisement_age(fresh),
             )
@@ -255,18 +259,12 @@ class Yeelock:
             age = self._advertisement_age(service_info)
             if age > CONNECTABLE_ADVERTISEMENT_MAX_AGE:
                 _LOGGER.debug(
-                    "Ignoring stale advertisement for %s (age=%.1fs)",
+                    "[%s] Ignoring stale advertisement for %s (age=%.1fs)",
+                    op_id,
                     self.mac,
                     age,
                 )
                 return
-            _LOGGER.debug(
-                "Fresh advertisement for %s (age=%.1fs, rssi=%s, source=%s)",
-                self.mac,
-                age,
-                service_info.rssi,
-                service_info.source,
-            )
             done.set_result(service_info)
 
         remove_callback = bluetooth.async_register_callback(
@@ -283,18 +281,30 @@ class Yeelock:
                 if remaining <= 0:
                     break
                 try:
-                    return await asyncio.wait_for(done, timeout=remaining)
+                    service_info = await asyncio.wait_for(done, timeout=remaining)
                 except TimeoutError:
                     if loop.time() >= deadline:
                         break
                     await self._trigger_active_scan_burst()
+                    continue
+                _LOGGER.info(
+                    "[%s] %s: advertisement received after %.1fs (rssi=%s, source=%s)",
+                    op_id,
+                    self.mac,
+                    monotonic_time_coarse() - wait_start,
+                    service_info.rssi,
+                    service_info.source,
+                )
+                return service_info
 
             fresh = self._fresh_service_info()
             if fresh:
                 _LOGGER.info(
-                    "Using last connectable advertisement for %s (%s, age=%.1fs)",
+                    "[%s] %s (%s): using last connectable advertisement after %.1fs (age=%.1fs)",
+                    op_id,
                     self.name or self.mac,
                     self.mac,
+                    monotonic_time_coarse() - wait_start,
                     self._advertisement_age(fresh),
                 )
                 return fresh
@@ -311,11 +321,13 @@ class Yeelock:
                     "Reachability diagnostics unavailable for %s", self.mac
                 )
             _LOGGER.warning(
-                "Lock %s (%s) did not send a fresh advertisement within %ss. "
-                "Diagnostics: %s",
+                "[%s] Lock %s (%s) did not send a fresh advertisement within %ss "
+                "(waited %.1fs). Diagnostics: %s",
+                op_id,
                 self.name or self.mac,
                 self.mac,
                 wait_timeout,
+                monotonic_time_coarse() - wait_start,
                 diagnostics,
             )
             raise BleakError(
@@ -363,6 +375,7 @@ class Yeelock:
         ble_device,
         *,
         max_attempts: int = CONNECTION_MAX_ATTEMPTS,
+        op_id: str = "-",
     ):
         """Connect to the lock with a single service-discovery retry."""
         try:
@@ -378,13 +391,15 @@ class Yeelock:
             if "discover services" not in str(error).lower():
                 raise
             _LOGGER.warning(
-                "Lock %s disconnected during service discovery; waking and retrying once",
+                "[%s] Lock %s disconnected during service discovery; waking and retrying once",
+                op_id,
                 self.name or self.mac,
             )
             await self._disconnect_client()
             await self._trigger_active_scan_burst()
             service_info = await self._wait_for_connectable_advertisement(
                 timeout=SERVICE_DISCOVERY_RETRY_AD_TIMEOUT,
+                op_id=op_id,
             )
             await asyncio.sleep(PRE_CONNECT_DELAY_SECONDS)
             ble_device = self._prepare_ble_device_for_connect(service_info)
@@ -406,6 +421,7 @@ class Yeelock:
         *,
         wait_for_advertisement: bool = True,
         advertisement_timeout: int | None = None,
+        op_id: str = "-",
     ):
         """Connect to the device.
 
@@ -423,6 +439,7 @@ class Yeelock:
                 if wait_for_advertisement:
                     service_info = await self._wait_for_connectable_advertisement(
                         timeout=advertisement_timeout,
+                        op_id=op_id,
                     )
                     await asyncio.sleep(PRE_CONNECT_DELAY_SECONDS)
                     ble_device = self._prepare_ble_device_for_connect(service_info)
@@ -434,14 +451,22 @@ class Yeelock:
                         f"A device with address {self.mac} could not be found."
                     )
 
-                _LOGGER.debug("Connecting to %s", self.mac)
-                self._client = await self._establish_yeelock_connection(ble_device)
+                connect_start = monotonic_time_coarse()
+                _LOGGER.debug("[%s] Connecting to %s", op_id, self.mac)
+                self._client = await self._establish_yeelock_connection(
+                    ble_device, op_id=op_id
+                )
                 self._connected = True
-                _LOGGER.debug("Connected to %s", self.mac)
+                _LOGGER.info(
+                    "[%s] %s: BLE connected after %.1fs",
+                    op_id,
+                    self.name or self.mac,
+                    monotonic_time_coarse() - connect_start,
+                )
                 await self._client.start_notify(
                     uuid.UUID(UUID_NOTIFY), self._handle_data
                 )
-                _LOGGER.debug("Listening for notifications from %s", self.mac)
+                _LOGGER.debug("[%s] Listening for notifications from %s", op_id, self.mac)
             except Exception:
                 await self._disconnect_client()
                 raise
@@ -576,32 +601,76 @@ class Yeelock:
         _LOGGER.debug("Prepared battery request command payload")
         return output_value
 
+    async def _send_lock_command(self, kind: str, op_id: str) -> None:
+        """Write the lock/unlock command to the active connection."""
+        loop = asyncio.get_running_loop()
+        self._command_state_waiter = loop.create_future()
+        _LOGGER.debug("[%s] Sending %s command to %s", op_id, kind, self.mac)
+        await self._client.write_gatt_char(
+            uuid.UUID(UUID_COMMAND), bytearray(self._encrypt(LOCKER_KIND[kind]))
+        )
+
     async def locker(self, kind) -> None:
         """Lock, unlock and quick unlock the device."""
         self._last_action = kind
-        cooldown_remaining = self._locker_cooldown_until - monotonic_time_coarse()
+        op_id = uuid.uuid4().hex[:8]
+        op_start = monotonic_time_coarse()
+
+        cooldown_remaining = self._locker_cooldown_until - op_start
         if cooldown_remaining > 0:
             _LOGGER.info(
-                "Waiting %.0fs for %s adapter to recover before retrying",
-                cooldown_remaining,
+                "[%s] %s: waiting %.0fs for adapter to recover before retrying",
+                op_id,
                 self.name or self.mac,
+                cooldown_remaining,
             )
             await asyncio.sleep(cooldown_remaining)
+
+        _LOGGER.info("[%s] %s: %s requested", op_id, self.name or self.mac, kind)
 
         async with _adapter_session(self._hass):
             try:
                 await self._connect(
                     advertisement_timeout=LOCK_ADVERTISEMENT_WAIT_TIMEOUT,
+                    op_id=op_id,
                 )
-                loop = asyncio.get_running_loop()
-                self._command_state_waiter = loop.create_future()
-                _LOGGER.debug("Sending %s command to %s", kind, self.mac)
-                await self._client.write_gatt_char(
-                    uuid.UUID(UUID_COMMAND), bytearray(self._encrypt(LOCKER_KIND[kind]))
-                )
+                try:
+                    await self._send_lock_command(kind, op_id)
+                except BleakError as error:
+                    if not any(
+                        marker in str(error).lower()
+                        for marker in ("unlikely", "protocol error")
+                    ):
+                        raise
+                    _LOGGER.warning(
+                        "[%s] %s: GATT protocol error, reconnecting and retrying once: %s",
+                        op_id,
+                        self.name or self.mac,
+                        error,
+                    )
+                    await self._disconnect_client()
+                    await self._connect(
+                        advertisement_timeout=SERVICE_DISCOVERY_RETRY_AD_TIMEOUT,
+                        op_id=op_id,
+                    )
+                    await self._send_lock_command(kind, op_id)
                 await self._wait_for_command_result(kind)
+                _LOGGER.info(
+                    "[%s] %s: %s confirmed after %.1fs total",
+                    op_id,
+                    self.name or self.mac,
+                    kind,
+                    monotonic_time_coarse() - op_start,
+                )
             except BleakError as error:
-                _LOGGER.error("BleakError for %s (%s): %s", self.name, self.mac, error)
+                _LOGGER.error(
+                    "[%s] %s: %s failed after %.1fs: %s",
+                    op_id,
+                    self.name or self.mac,
+                    kind,
+                    monotonic_time_coarse() - op_start,
+                    error,
+                )
                 if any(
                     marker in str(error).lower()
                     for marker in ("connection slot", "discover services", "timeout")
